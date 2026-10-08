@@ -16,40 +16,85 @@ app.use(express.static(__dirname));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
+// --- IN-MEMORY STATE (Exact Match to Local PC Structure) ---
+let dbState = {};
+let tripSummary = {};
+
 // --- MONGODB CONNECTION ---
 mongoose.connect(MONGO_URI)
-  .then(() => console.log("[MONGODB] Connected to MongoDB Atlas successfully!"))
+  .then(async () => {
+    console.log("[MONGODB] Connected to MongoDB Atlas successfully!");
+    await loadStateFromDB();
+  })
   .catch(err => console.error("[MONGODB] Connection error:", err));
 
 // --- MONGOOSE SCHEMAS ---
 const telemetrySchema = new mongoose.Schema({
-  pbs: { type: String, required: true },
-  sub: { type: String, required: true },
-  dev: { type: String, required: true },
-  feeder: { type: String, required: true },
-  status: { type: String, default: "OFF" },
-  power: {
-    V: Number,
-    I: Number,
-    P: Number,
-    PF: Number,
-    F: Number
-  },
+  pbs: String,
+  sub: String,
+  dev: String,
+  key: String, // 'power', 'status', or feeder name (e.g., NG3_1A)
+  data: mongoose.Schema.Types.Mixed,
   timestamp: { type: Date, default: Date.now }
 });
-
 const TelemetryData = mongoose.model('TelemetryData', telemetrySchema);
 
 const tripSummarySchema = new mongoose.Schema({
   feederKey: { type: String, unique: true },
+  pbs: String,
+  sub: String,
+  dev: String,
+  relay: String,
   thisMonthTrips: { type: Number, default: 0 },
   lastMonthTrips: { type: Number, default: 0 },
   lastTripTime: { type: String, default: "--" },
   lastOnTime: { type: String, default: "--" },
   faultReason: { type: String, default: "" }
 });
-
 const TripSummary = mongoose.model('TripSummary', tripSummarySchema);
+
+// Load state from MongoDB into local nested structure on startup
+async function loadStateFromDB() {
+  try {
+    const allTelemetry = await TelemetryData.find({});
+    allTelemetry.forEach(item => {
+      const { pbs, sub, dev, key, data, timestamp } = item;
+      if (!dbState[pbs]) dbState[pbs] = {};
+      if (!dbState[pbs][sub]) dbState[pbs][sub] = {};
+      if (!dbState[pbs][sub][dev]) dbState[pbs][sub][dev] = {};
+      
+      dbState[pbs][sub][dev][key] = data;
+      if (key === 'power' || key !== 'status') {
+        dbState[pbs][sub][dev]['lastHeartbeat'] = Math.floor(new Date(timestamp).getTime() / 1000);
+      }
+    });
+
+    const allTrips = await TripSummary.find({});
+    allTrips.forEach(t => {
+      tripSummary[t.feederKey] = {
+        thisMonthTrips: t.thisMonthTrips,
+        lastMonthTrips: t.lastMonthTrips,
+        lastTripTime: t.lastTripTime,
+        lastOnTime: t.lastOnTime,
+        faultReason: t.faultReason
+      };
+    });
+    console.log(`[STARTUP] Loaded nested state for ${Object.keys(dbState).length} PBS from MongoDB.`);
+  } catch (err) {
+    console.error("[STARTUP ERROR] Failed to load state from DB:", err);
+  }
+}
+
+function setDeepValue(obj, pathArray, value) {
+  let current = obj;
+  for (let i = 0; i < pathArray.length - 1; i++) {
+    const key = pathArray[i];
+    if (!current[key] || typeof current[key] !== 'object') current[key] = {};
+    current = current[key];
+  }
+  const lastKey = pathArray[pathArray.length - 1];
+  current[lastKey] = value;
+}
 
 // --- REST API ENDPOINTS ---
 
@@ -57,22 +102,32 @@ const TripSummary = mongoose.model('TripSummary', tripSummarySchema);
 app.post('/api/telemetry', async (req, res) => {
   try {
     const { pbs, sub, dev, feeder, status, power } = req.body;
-    
     if (!pbs || !sub || !dev || !feeder) {
-      return res.status(400).json({ success: false, message: "Missing required fields (pbs, sub, dev, feeder)" });
+      return res.status(400).json({ success: false, message: "Missing required fields" });
     }
 
-    // Save/Update telemetry data
+    let payloadToStore;
+    if (feeder === 'power') {
+      payloadToStore = power; // Station-level power object
+    } else {
+      payloadToStore = { status, power }; // Feeder status + power object
+    }
+
+    // Save to MongoDB
     await TelemetryData.findOneAndUpdate(
-      { pbs, sub, dev, feeder },
-      { status, power, timestamp: new Date() },
+      { pbs, sub, dev, key: feeder },
+      { data: payloadToStore, timestamp: new Date() },
       { upsert: true, new: true }
     );
 
-    // Broadcast real-time update to web dashboard via Socket.io
-    io.emit('db_update', { pbs, sub, dev, feeder, status, power });
+    // Replicate exact local in-memory structure
+    setDeepValue(dbState, [pbs, sub, dev, feeder], payloadToStore);
+    setDeepValue(dbState, [pbs, sub, dev, 'lastHeartbeat'], Math.floor(Date.now() / 1000));
 
-    res.status(200).json({ success: true, message: "Telemetry received and saved." });
+    // Broadcast live update to dashboard via Socket.io
+    io.emit('db_update', { fullDb: dbState });
+
+    res.status(200).json({ success: true });
   } catch (err) {
     console.error("[TELEMETRY ERROR]", err);
     res.status(500).json({ success: false, error: err.message });
@@ -82,23 +137,34 @@ app.post('/api/telemetry', async (req, res) => {
 // 2. Dashboard Data Feed for ALL_PBS.html
 app.get('/api/dashboardData', async (req, res) => {
   try {
-    const allTelemetry = await TelemetryData.find({});
-    const allTrips = await TripSummary.find({});
-    
-    const tripList = allTrips.map(t => ({
-      feederKey: t.feederKey,
-      thisMonthTrips: t.thisMonthTrips,
-      lastMonthTrips: t.lastMonthTrips,
-      lastTripTime: t.lastTripTime,
-      lastOnTime: t.lastOnTime
-    }));
+    const tripList = [];
+    const faultList = [];
 
-    const faultList = allTrips.filter(t => t.faultReason).map(t => ({
-      feederKey: t.feederKey,
-      fault: t.faultReason
-    }));
+    for (let pbs in dbState) {
+      for (let sub in dbState[pbs]) {
+        for (let dev in dbState[pbs][sub]) {
+          for (let relay in dbState[pbs][sub][dev]) {
+            if (["power", "deviceStatus", "lastHeartbeat"].includes(relay)) continue;
 
-    res.json({ trip: tripList, fault: faultList, telemetry: allTelemetry });
+            const feederKey = `${pbs}_${sub}_${dev}_${relay}`;
+            const summary = tripSummary[feederKey] || { thisMonthTrips: 0, lastMonthTrips: 0, lastTripTime: "--", lastOnTime: "--", faultReason: "" };
+
+            tripList.push({
+              pbs, sub, dev, relay, feeder: relay,
+              thisMonthTrips: summary.thisMonthTrips,
+              lastMonthTrips: summary.lastMonthTrips,
+              lastTripTime: summary.lastTripTime,
+              lastOnTime: summary.lastOnTime,
+              area: "N/A"
+            });
+
+            faultList.push({ pbs, sub, dev, relay, feeder: relay, fault: summary.faultReason || "" });
+          }
+        }
+      }
+    }
+
+    res.json({ trip: tripList, fault: faultList, reliability: [] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -112,7 +178,7 @@ app.post('/api/saveFault', async (req, res) => {
 
     let summary = await TripSummary.findOne({ feederKey });
     if (!summary) {
-      summary = new TripSummary({ feederKey });
+      summary = new TripSummary({ feederKey, pbs, sub, dev, relay });
     }
 
     if (status === "ON" || message === "CLEAR") {
@@ -124,6 +190,14 @@ app.post('/api/saveFault', async (req, res) => {
     }
 
     await summary.save();
+    tripSummary[feederKey] = {
+      thisMonthTrips: summary.thisMonthTrips,
+      lastMonthTrips: summary.lastMonthTrips,
+      lastTripTime: summary.lastTripTime,
+      lastOnTime: summary.lastOnTime,
+      faultReason: summary.faultReason
+    };
+
     res.json({ success: true, faultReason: summary.faultReason });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -131,20 +205,13 @@ app.post('/api/saveFault', async (req, res) => {
 });
 
 // --- SOCKET CONNECTION ---
-io.on('connection', async (socket) => {
-  console.log('[SOCKET] Client connected.');
-  try {
-    const allTelemetry = await TelemetryData.find({});
-    socket.emit('initial_state', allTelemetry);
-  } catch (err) {
-    console.error('[SOCKET ERROR]', err);
-  }
+io.on('connection', (socket) => {
+  socket.emit('initial_state', dbState);
 });
 
 // --- START SERVER ---
 server.listen(PORT, () => {
   console.log(`===================================================`);
-  console.log(` BREB Cloud Telemetry Server Active                `);
-  console.log(` Port                 : ${PORT}                    `);
+  console.log(` BREB Cloud Telemetry Server Active on Port ${PORT} `);
   console.log(`===================================================`);
 });
