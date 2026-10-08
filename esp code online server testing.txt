@@ -1,0 +1,233 @@
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <PZEM004Tv30.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// --- CLOUD SERVER CONFIGURATION ---
+const String serverName = "https://esp32-cloud-backend-q3rr.onrender.com/api/telemetry";
+
+Preferences preferences;
+String PBS_ID, SUB_ID, DEVICE_ID;
+String FEEDER_STRING; 
+
+String feederKeys[9];
+int totalKeys = 0;
+
+const int relayPins[9] = { 19, 25, 27, 32, 33, 34, 35, 36, 39 };
+
+String lastStatus[9];
+const int requiredStableCount = 5; 
+int stableCounter[9] = {0};
+const unsigned long interval = 25000; // Publish every 25 seconds over HTTP
+unsigned long lastUpdate = 0;
+unsigned long lastWifiCheck = 0;
+
+// Shared Hardware Serial 2 Pins for Modbus Bus
+#define PZEM_RX 18
+#define PZEM_TX 14
+
+// Bus Unit (Single Transformer / Station Metering at Address 0x01)
+PZEM004Tv30 pzemUnit1(Serial2, PZEM_RX, PZEM_TX, 0x01); 
+
+// Array for Feeder Modules (Addresses 0x02 to 0x0A)
+PZEM004Tv30* pzemFeeders[9];
+
+// Single Station / Bus Telemetry (Unit 1)
+float u1_v = 0, u1_i = 0, u1_p = 0, u1_f = 0, u1_pf = 0;
+
+// Feeder Telemetry Mapped to Feeder Keys
+float f_v[9]  = {0};
+float f_i[9]  = {0};
+float f_p[9]  = {0};
+float f_pf[9] = {0};
+
+void parseFeeders(String input) {
+  totalKeys = 0;
+  input.trim();
+  if (input.length() == 0) return;
+
+  int startPos = 0;
+  int endPos = input.indexOf(',');
+  
+  while (endPos != -1 && totalKeys < 9) {
+    String key = input.substring(startPos, endPos);
+    key.trim();
+    if (key.length() > 0) {
+      feederKeys[totalKeys] = key;
+      totalKeys++;
+    }
+    startPos = endPos + 1;
+    endPos = input.indexOf(',', startPos);
+  }
+  
+  if (totalKeys < 9) {
+    String key = input.substring(startPos);
+    key.trim();
+    if (key.length() > 0) {
+      feederKeys[totalKeys] = key;
+      totalKeys++;
+    }
+  }
+}
+
+void sendTelemetryToCloud() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  // 1. Send Station Bus Power as a special device entry or individual payload if needed
+  // (Optional: You can also post station-level metrics if your backend schema accommodates it)
+
+  // 2. Loop and send each feeder status & power data to the Render cloud backend
+  for (int i = 0; i < totalKeys; i++) {
+    http.begin(serverName);
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<256> doc;
+    doc["pbs"]    = PBS_ID;
+    doc["sub"]    = SUB_ID;
+    doc["dev"]    = DEVICE_ID;
+    doc["feeder"] = feederKeys[i];
+    doc["status"] = lastStatus[i];
+
+    JsonObject powerObj = doc.createNestedObject("power");
+    powerObj["V"]  = f_v[i];
+    powerObj["I"]  = f_i[i];
+    powerObj["P"]  = f_p[i];
+    powerObj["PF"] = f_pf[i];
+
+    String requestBody;
+    serializeJson(doc, requestBody);
+
+    int httpResponseCode = http.POST(requestBody);
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("[HTTP] Feeder " + feederKeys[i] + " sent successfully. Code: " + String(httpResponseCode));
+    } else {
+      Serial.println("[HTTP] Error sending feeder " + feederKeys[i] + ", Code: " + String(httpResponseCode));
+    }
+
+    http.end();
+    delay(50); // Small delay between HTTP requests
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, PZEM_RX, PZEM_TX);
+
+  for (uint8_t i = 0; i < 9; i++) {
+    pzemFeeders[i] = new PZEM004Tv30(Serial2, PZEM_RX, PZEM_TX, i + 2);
+  }
+  
+  preferences.begin("ident", false);
+  PBS_ID = preferences.getString("pbs", "Naogaon_PBS_1"); 
+  SUB_ID = preferences.getString("sub", "NG3"); 
+  FEEDER_STRING = preferences.getString("feeders", "NG3_1A,NG3_2B,NG3_3C,NG3_5E,NG3_6F");
+  DEVICE_ID = "DEV_001";
+
+  parseFeeders(FEEDER_STRING);
+
+  WiFiManager wm;
+  WiFiManagerParameter pbs("pbs", "PBS ID", PBS_ID.c_str(), 20);
+  WiFiManagerParameter sub("sub", "SUB ID", SUB_ID.c_str(), 20);
+  WiFiManagerParameter fdr("feeders", "Feeders (comma-separated)", FEEDER_STRING.c_str(), 150);
+  
+  wm.addParameter(&pbs); 
+  wm.addParameter(&sub);
+  wm.addParameter(&fdr);
+  
+  wm.setConfigPortalTimeout(120); 
+  if (!wm.autoConnect("ESP32_Universal_Config")) ESP.restart();
+  
+  PBS_ID = pbs.getValue(); 
+  SUB_ID = sub.getValue();
+  FEEDER_STRING = fdr.getValue();
+  
+  preferences.putString("pbs", PBS_ID); 
+  preferences.putString("sub", SUB_ID); 
+  preferences.putString("feeders", FEEDER_STRING);
+  preferences.end();
+  
+  parseFeeders(FEEDER_STRING);
+  
+  for (int i = 0; i < 9; i++) { 
+    pinMode(relayPins[i], INPUT);
+    lastStatus[i] = (digitalRead(relayPins[i]) == LOW) ? "OFF" : "ON";
+  }
+  configTime(6 * 3600, 0, "pool.ntp.org");
+
+  sendTelemetryToCloud(); 
+}
+
+void loop() {
+  if (millis() > 86400000UL) {
+    ESP.restart();
+  }
+
+  if (millis() - lastWifiCheck > 30000) { 
+    lastWifiCheck = millis(); 
+    if (WiFi.status() != WL_CONNECTED) WiFi.begin(); 
+  }
+
+  // --- 1. READ UNIT 1 (Address 0x01) ---
+  while(Serial2.available()) Serial2.read();
+  float v1 = pzemUnit1.voltage();
+  if (!isnan(v1) && v1 >= 0.00 && v1 < 600.0) { 
+    u1_v = v1 * 0.1732; 
+    float raw_i1 = pzemUnit1.current();
+    u1_i = (!isnan(raw_i1) && raw_i1 >= 0.00) ? (raw_i1 * 160.0) : 0.00; 
+    float raw_p1 = pzemUnit1.power();
+    u1_p = (!isnan(raw_p1) && raw_p1 >= 0.00) ? (raw_p1 * 0.048) : 0.00;
+    float raw_f1 = pzemUnit1.frequency();
+    u1_f = (!isnan(raw_f1) && raw_f1 >= 0.00) ? raw_f1 : 0.00; 
+    float raw_pf1 = pzemUnit1.pf();
+    u1_pf = (!isnan(raw_pf1) && raw_pf1 >= 0.00 && raw_pf1 <= 1.0) ? raw_pf1 : 0.00; 
+  } else {
+    u1_v = 0; u1_i = 0; u1_p = 0; u1_f = 0; u1_pf = 0;
+  }
+  delay(80);
+
+  // --- 2. READ FEEDER MODULES (Addresses 0x02 to totalKeys + 1) ---
+  for (int i = 0; i < totalKeys; i++) {
+    while(Serial2.available()) Serial2.read();
+
+    float vf = pzemFeeders[i]->voltage();
+    if (!isnan(vf) && vf >= 0.00 && vf < 600.0) { 
+      f_v[i] = vf * 0.1732; 
+      float raw_if = pzemFeeders[i]->current();
+      f_i[i] = (!isnan(raw_if) && raw_if >= 0.00) ? (raw_if * 60.0) : 0.00; 
+      float raw_pf = pzemFeeders[i]->power();
+      f_p[i] = (!isnan(raw_pf) && raw_pf >= 0.00) ? (raw_pf * 0.006) : 0.00;
+      float raw_pff = pzemFeeders[i]->pf();
+      f_pf[i] = (!isnan(raw_pff) && raw_pff >= 0.00 && raw_pff <= 1.0) ? raw_pff : 0.00; 
+    } else {
+      f_v[i] = 0.00; f_i[i] = 0.00; f_p[i] = 0.00; f_pf[i] = 0.00;
+    }
+    delay(80);
+  }
+
+  // --- RELAY DEBOUNCE & STATUS CHECK ---
+  for (int i = 0; i < totalKeys; i++) {
+    String currentRead = (digitalRead(relayPins[i]) == LOW) ? "OFF" : "ON";
+    if (currentRead != lastStatus[i]) {
+      stableCounter[i]++;
+      if (stableCounter[i] >= requiredStableCount) {
+        lastStatus[i] = currentRead; 
+        stableCounter[i] = 0;
+        sendTelemetryToCloud(); 
+      }
+    } else {
+      stableCounter[i] = 0;
+    }
+  }
+  
+  if (millis() - lastUpdate >= interval) { 
+    lastUpdate = millis(); 
+    sendTelemetryToCloud(); 
+  }
+  delay(50); 
+}
